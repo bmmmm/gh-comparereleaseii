@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# gh extension wrapper for comparereleaseii: fact-check release notes
+# against the actual code diff. The real tool is fetched once, pinned to
+# the exact commit in tool.pin, and updated only when `gh extension
+# upgrade` delivers a new pin — nothing on your machine tracks a moving
+# branch.
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL_REPO="https://github.com/bmmmm/comparereleaseii.git"
+TOOL_DIR="$DIR/tool"
+
+read -r PIN_SHA PIN_TAG < "$DIR/tool.pin" || true
+# The pin must be an immutable commit hash — a branch or tag name here
+# would silently defeat the whole point, so it is rejected, not resolved.
+if ! [[ "${PIN_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || [ -z "${PIN_TAG:-}" ]; then
+  echo "gh-comparereleaseii: malformed tool.pin (expected '<40-hex commit sha> <tag>') — reinstall with:" >&2
+  echo "  gh extension remove comparereleaseii && gh extension install bmmmm/gh-comparereleaseii" >&2
+  exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "gh-comparereleaseii: Node.js >= 24 is required (runs the tool's TypeScript directly)." >&2
+  echo "Install it from https://nodejs.org or your package manager, then re-run." >&2
+  exit 1
+fi
+if ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 24 ? 0 : 1)'; then
+  echo "gh-comparereleaseii: Node.js >= 24 is required, found $(node --version)." >&2
+  exit 1
+fi
+
+# Self-heal: a tool dir that is not a usable git checkout is recloned.
+if [ -d "$TOOL_DIR" ] && ! git -C "$TOOL_DIR" rev-parse HEAD >/dev/null 2>&1; then
+  rm -rf "$TOOL_DIR"
+fi
+
+FIRST_RUN=0
+if [ ! -d "$TOOL_DIR" ]; then
+  FIRST_RUN=1
+  echo "gh-comparereleaseii: first run - fetching comparereleaseii $PIN_TAG (needs network, ~1 MB)..." >&2
+  git clone --quiet --no-checkout --filter=blob:none "$TOOL_REPO" "$TOOL_DIR" || {
+    echo "gh-comparereleaseii: cloning $TOOL_REPO failed — check network access and write permission on $DIR, then retry." >&2
+    exit 1
+  }
+fi
+
+if [ "$(git -C "$TOOL_DIR" rev-parse HEAD 2>/dev/null || true)" != "$PIN_SHA" ] || [ ! -f "$TOOL_DIR/src/cli.ts" ]; then
+  [ "$FIRST_RUN" = 1 ] || echo "gh-comparereleaseii: switching to comparereleaseii $PIN_TAG ($PIN_SHA)..." >&2
+  # Fetch the pinned commit explicitly: the default refspec would miss a
+  # release tagged off a non-default branch (hotfix), stranding upgrades.
+  git -C "$TOOL_DIR" fetch --quiet origin "$PIN_SHA" 2>/dev/null || true
+  git -C "$TOOL_DIR" checkout --quiet --detach "$PIN_SHA" || {
+    echo "gh-comparereleaseii: pinned commit $PIN_SHA ($PIN_TAG) is not available upstream — run 'gh extension upgrade comparereleaseii' and retry." >&2
+    exit 1
+  }
+fi
+
+exec node "$TOOL_DIR/src/cli.ts" "$@"

@@ -1,0 +1,64 @@
+# Follows comparereleaseii releases automatically: once a day, resolve the
+# latest release tag to its commit SHA and commit the new pin. Zero
+# third-party actions on purpose — the whole job is `gh` against the
+# GitHub API with the repo-scoped GITHUB_TOKEN, so there is no supply
+# chain to audit and no secret to rotate.
+#
+# Never publish releases with platform-suffixed binary assets in THIS
+# repo — gh would auto-migrate the extension to "binary" mode and break
+# every install and upgrade.
+name: bump-pin
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: bump-pin
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Pin the latest comparereleaseii release
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/bmmmm/comparereleaseii/releases/latest --jq .tag_name)" || {
+            echo "upstream has no releases yet - nothing to pin"
+            exit 0
+          }
+          ref="$(gh api "repos/bmmmm/comparereleaseii/git/ref/tags/$tag" --jq .object)"
+          sha="$(jq -r .sha <<<"$ref")"
+          if [ "$(jq -r .type <<<"$ref")" = "tag" ]; then
+            sha="$(gh api "repos/bmmmm/comparereleaseii/git/tags/$sha" --jq .object.sha)"
+          fi
+          new="$(printf '%s %s\n' "$sha" "$tag")"
+          cur_json="$(gh api "repos/$GITHUB_REPOSITORY/contents/tool.pin")"
+          cur="$(jq -r .content <<<"$cur_json" | base64 -d)"
+          if [ "$cur" != "$new" ]; then
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/tool.pin" \
+              -f message="Pin comparereleaseii $tag" \
+              -f content="$(printf '%s\n' "$new" | base64 -w0)" \
+              -f sha="$(jq -r .sha <<<"$cur_json")" > /dev/null
+            echo "pinned $tag ($sha)"
+            exit 0
+          fi
+          echo "pin already at $tag ($sha)"
+
+          # GitHub disables scheduled workflows after 60 days without repo
+          # activity - in the steady state (no upstream release for two
+          # months) this job would silently stop. A heartbeat commit at 50
+          # days keeps the schedule alive with zero human attention.
+          last="$(gh api "repos/$GITHUB_REPOSITORY/commits?per_page=1" --jq '.[0].commit.committer.date')"
+          age_days=$(( ( $(date +%s) - $(date -d "$last" +%s) ) / 86400 ))
+          if [ "$age_days" -ge 50 ]; then
+            hb_json="$(gh api "repos/$GITHUB_REPOSITORY/contents/.heartbeat" 2>/dev/null || true)"
+            args=( -f message="Heartbeat: keep the scheduled bump alive" )
+            args+=( -f content="$(printf '%s\n' "$(date -u +%F)" | base64 -w0)" )
+            [ -n "$hb_json" ] && args+=( -f sha="$(jq -r .sha <<<"$hb_json")" )
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/.heartbeat" "${args[@]}" > /dev/null
+            echo "heartbeat committed (last activity $age_days days ago)"
+          fi
