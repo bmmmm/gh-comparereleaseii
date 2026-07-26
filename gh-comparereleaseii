@@ -56,4 +56,6 @@ if [ "$(git -C "$TOOL_DIR" rev-parse HEAD 2>/dev/null || true)" != "$PIN_SHA" ] 
   }
 fi
 
+# Tool >= 0.1.1 shows this as the program name in help and errors.
+export COMPARERELEASE_PROG="gh comparereleaseii"
 exec node "$TOOL_DIR/src/cli.ts" "$@"
